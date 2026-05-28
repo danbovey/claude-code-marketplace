@@ -1,0 +1,13 @@
+{
+  "name": "artifacts",
+  "version": "1.1.0",
+  "description": "Save shareable Claude Code outputs to a private Notion database with a local clipboard cache. Stops terminal-wrap line breaks when pasting Claude output into Slack, GitHub, or Notion.",
+  "author": {
+    "name": "Dan Bovey",
+    "url": "https://github.com/danbovey"
+  },
+  "homepage": "https://github.com/danbovey/claude-code-marketplace/tree/main/plugins/artifacts",
+  "repository": "https://github.com/danbovey/claude-code-marketplace",
+  "license": "MIT",
+  "keywords": ["notion", "clipboard", "skills"]
+}

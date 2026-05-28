@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+# /artifacts read-side helper — invoked from Claude Code sessions (no TTY).
+# Notion is the source of truth; local files are a clipboard cache.
+# Subcommands: (default), list, copy [name], rm <name>, clear, share [name], path, url
+# Multi-candidate picks always exit 2 with NEEDS_PICKER / NEEDS_PICKER_LINK on stderr;
+# the calling skill prompts the user via AskUserQuestion and re-invokes with `copy <name>` or `share <name>`.
+
+set -euo pipefail
+
+ART_ROOT="$HOME/.claude/artifacts"
+# Registry is a dotfile inside the cache dir — hidden from the artifact-listing
+# glob (which excludes dotfiles by default), so it doesn't collide with slugs.
+# Kept out of the plugin's install dir so plugin updates can't clobber it.
+NOTION_JSON="$ART_ROOT/.notion.json"
+mkdir -p "$ART_ROOT"
+
+# Scope filter: applied to default list/pick/share. --all disables it.
+SCOPE_ALL=0
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# Resolve current scope (repo + project_path) from cwd. Both tolerate non-git
+# directories — capture-then-process avoids `set -o pipefail` propagating
+# git's exit 128 when cwd isn't a repo (e.g. ~ or /tmp).
+current_repo() {
+  local url
+  url=$(git remote get-url origin 2>/dev/null) || return 0
+  printf '%s' "$url" \
+    | sed -E 's|.*[:/]([^/]+/[^/]+)(\.git)?$|\1|' \
+    | sed -E 's|\.git$||'
+}
+
+current_project_path() {
+  local root
+  if root=$(git rev-parse --show-toplevel 2>/dev/null); then
+    printf '%s' "$root"
+  else
+    pwd
+  fi
+}
+
+# Return registry metadata for a slug.
+registry_repo() {
+  local slug="$1"
+  [ -f "$NOTION_JSON" ] || { echo ""; return 0; }
+  jq -r --arg s "$slug" '.pages[$s].repo // ""' "$NOTION_JSON" 2>/dev/null
+}
+
+registry_project_path() {
+  local slug="$1"
+  [ -f "$NOTION_JSON" ] || { echo ""; return 0; }
+  jq -r --arg s "$slug" '.pages[$s].project_path // ""' "$NOTION_JSON" 2>/dev/null
+}
+
+# True (0) if the artifact filename belongs to the current scope.
+in_scope() {
+  local name="$1" slug repo proj cur_repo cur_proj
+  slug="${name%.*}"
+  repo=$(registry_repo "$slug")
+  proj=$(registry_project_path "$slug")
+  cur_repo=$(current_repo)
+  cur_proj=$(current_project_path)
+  # Prefer repo match when current dir has a remote.
+  if [ -n "$cur_repo" ]; then
+    [ "$repo" = "$cur_repo" ] && return 0 || return 1
+  fi
+  # Otherwise match by project_path (exact or prefix).
+  [ -n "$proj" ] && [ "$cur_proj" = "$proj" ] && return 0
+  return 1
+}
+
+human_size() {
+  local b=$1
+  if   [ "$b" -lt 1024 ];     then printf '%d B'    "$b"
+  elif [ "$b" -lt 1048576 ];  then awk -v b="$b" 'BEGIN{printf "%.1f KB", b/1024}'
+  else                              awk -v b="$b" 'BEGIN{printf "%.1f MB", b/1048576}'
+  fi
+}
+
+human_age() {
+  local s=$1
+  if   [ "$s" -lt 60 ];    then printf '%ds ago' "$s"
+  elif [ "$s" -lt 3600 ];  then printf '%dm ago' "$((s/60))"
+  elif [ "$s" -lt 86400 ]; then printf '%dh ago' "$((s/3600))"
+  else                          printf '%dd ago' "$((s/86400))"
+  fi
+}
+
+# Look up the Notion URL for an artifact filename. Strips extension.
+notion_url_for() {
+  local name="$1" slug
+  slug="${name%.*}"
+  [ -f "$NOTION_JSON" ] || { echo ""; return 0; }
+  jq -r --arg s "$slug" '.pages[$s].url // ""' "$NOTION_JSON" 2>/dev/null
+}
+
+list_rows() {
+  # Tab-separated: mtime<TAB>filename<TAB>size<TAB>age<TAB>url — sorted newest first.
+  # Respects SCOPE_ALL: if 0 and a scope exists, returns only in-scope rows;
+  # falls back to all rows when the scoped set is empty.
+  local now f mtime size age url name scoped_rows all_rows
+  now=$(date +%s)
+  shopt -s nullglob
+  all_rows=""
+  scoped_rows=""
+  for f in "$ART_ROOT"/*; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f")
+    mtime=$(stat -f %m "$f")
+    size=$(stat -f %z "$f")
+    age=$((now - mtime))
+    url=$(notion_url_for "$name")
+    local row
+    row=$(printf '%s\t%s\t%s\t%s\t%s' "$mtime" "$name" "$(human_size "$size")" "$(human_age "$age")" "$url")
+    all_rows+="$row"$'\n'
+    if [ "$SCOPE_ALL" -eq 0 ] && in_scope "$name"; then
+      scoped_rows+="$row"$'\n'
+    fi
+  done
+  if [ "$SCOPE_ALL" -eq 1 ]; then
+    printf '%s' "$all_rows" | sort -rn
+  elif [ -n "$scoped_rows" ]; then
+    printf '%s' "$scoped_rows" | sort -rn
+  else
+    # Scope filter matched nothing; fall back to everything (so the picker isn't empty when scope is "lonely").
+    printf '%s' "$all_rows" | sort -rn
+  fi
+}
+
+scope_banner() {
+  local cur_repo cur_proj
+  cur_repo=$(current_repo)
+  cur_proj=$(current_project_path)
+  if [ "$SCOPE_ALL" -eq 1 ]; then
+    echo "Scope: all artifacts"
+  elif [ -n "$cur_repo" ]; then
+    echo "Scope: repo $cur_repo  (--all for everything)"
+  else
+    echo "Scope: $cur_proj  (--all for everything)"
+  fi
+}
+
+cmd_list() {
+  local rows
+  rows=$(list_rows)
+  scope_banner
+  if [ -z "$rows" ]; then
+    echo "No artifacts cached in $ART_ROOT."
+    [ -f "$NOTION_JSON" ] && echo "Run /artifacts refresh to pull from Notion."
+    return 0
+  fi
+  printf '%-40s  %-10s  %-10s  %s\n' "NAME" "SIZE" "AGE" "NOTION"
+  while IFS=$'\t' read -r _ name size age url; do
+    [ -n "$url" ] && link="✓" || link="—"
+    printf '%-40s  %-10s  %-10s  %s\n' "$name" "$size" "$age" "$link"
+  done <<< "$rows"
+}
+
+emit_candidates() {
+  # Stderr: tab-separated rows for the caller to parse, then a marker.
+  local marker="$1"
+  list_rows | awk -F'\t' '{ link=($5==""?"—":"✓"); printf "%s\t%s\t%s\t%s\n", $2, $3, $4, link }' >&2
+  echo "$marker" >&2
+  exit 2
+}
+
+copy_text() {
+  local name="$1"
+  local path="$ART_ROOT/$name"
+  [ -f "$path" ] || die "Not cached locally: $name (try /artifacts refresh)"
+  command -v pbcopy >/dev/null 2>&1 || die "pbcopy not available — macOS only. File: $path"
+  pbcopy < "$path"
+  local bytes
+  bytes=$(wc -c < "$path" | tr -d ' ')
+  echo "Copied $name ($bytes bytes) to clipboard."
+}
+
+copy_link() {
+  local name="$1" url
+  url=$(notion_url_for "$name")
+  if [ -z "$url" ]; then
+    die "No Notion URL recorded for $name. Try /artifacts refresh or re-save it."
+  fi
+  command -v pbcopy >/dev/null 2>&1 || die "pbcopy not available — macOS only. URL: $url"
+  printf '%s' "$url" | pbcopy
+  echo "Copied Notion link for ${name%.*} to clipboard: $url"
+}
+
+resolve_match() {
+  # Echo single filename or fail. Fuzzy match on basename.
+  local query="$1" matches n
+  if [ -f "$ART_ROOT/$query" ]; then printf '%s\n' "$query"; return 0; fi
+  matches=$(list_rows | cut -f2 | awk -v q="$query" 'index($0, q)')
+  n=$(printf '%s\n' "$matches" | grep -c . || true)
+  if   [ "$n" -eq 0 ]; then die "No artifact matches '$query'."
+  elif [ "$n" -eq 1 ]; then printf '%s\n' "$matches"
+  else                      printf 'Ambiguous — matches:\n%s\n' "$matches" >&2; return 1
+  fi
+}
+
+cmd_default() {
+  local rows count name
+  rows=$(list_rows)
+  if [ -z "$rows" ]; then
+    echo "No artifacts yet. Ask Claude to save one or auto-save shareable outputs."
+    return 0
+  fi
+  count=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+  if [ "$count" -eq 1 ]; then
+    name=$(printf '%s\n' "$rows" | cut -f2)
+    copy_text "$name"
+  else
+    emit_candidates "NEEDS_PICKER"
+  fi
+}
+
+cmd_copy() {
+  if [ $# -eq 0 ]; then cmd_default; return; fi
+  local name
+  name=$(resolve_match "$1")
+  copy_text "$name"
+}
+
+cmd_share() {
+  if [ $# -eq 0 ]; then
+    local rows count name
+    rows=$(list_rows)
+    [ -z "$rows" ] && { echo "No artifacts yet."; return 0; }
+    count=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+    if [ "$count" -eq 1 ]; then
+      name=$(printf '%s\n' "$rows" | cut -f2)
+      copy_link "$name"
+    else
+      emit_candidates "NEEDS_PICKER_LINK"
+    fi
+  else
+    local name
+    name=$(resolve_match "$1")
+    copy_link "$name"
+  fi
+}
+
+cmd_rm() {
+  [ $# -ge 1 ] || die "Usage: $0 rm <name>"
+  local name path
+  name=$(resolve_match "$1")
+  path="$ART_ROOT/$name"
+  rm "$path"
+  echo "Removed local cache: $name. Notion row untouched."
+}
+
+cmd_clear() {
+  local count
+  count=$(find "$ART_ROOT" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')
+  [ "$count" -eq 0 ] && { echo "Cache already empty."; return 0; }
+  find "$ART_ROOT" -mindepth 1 -maxdepth 1 -type f -delete
+  echo "Cleared $count cached artifacts. Notion rows untouched. Run /artifacts refresh to repopulate."
+}
+
+cmd_path() { echo "$ART_ROOT"; }
+
+cmd_url() {
+  [ -f "$NOTION_JSON" ] || die "No Notion config at $NOTION_JSON. Run /artifacts init."
+  jq -r '.database_url // ""' "$NOTION_JSON"
+}
+
+# Setup / re-setup. Idempotent and non-destructive: never deletes anything,
+# never mutates an existing notion.json without --reconfigure, never assumes
+# a Notion DB is the right one without Claude verifying it's private.
+cmd_init() {
+  local reconfigure=0
+  for a in "$@"; do
+    [ "$a" = "--reconfigure" ] && reconfigure=1
+  done
+
+  echo "Preflight:"
+  local ok=1
+  if command -v jq >/dev/null 2>&1; then
+    echo "  ✓ jq        $(jq --version)"
+  else
+    echo "  ✗ jq        not found — install with: brew install jq"
+    ok=0
+  fi
+  if command -v pbcopy >/dev/null 2>&1; then
+    echo "  ✓ pbcopy    (macOS)"
+  else
+    echo "  ✗ pbcopy    not found — this skill is macOS-only for now"
+    ok=0
+  fi
+  if command -v git >/dev/null 2>&1; then
+    echo "  ✓ git       $(git --version | awk '{print $3}')"
+  else
+    echo "  ✗ git       not found — install Xcode CLT or via Homebrew"
+    ok=0
+  fi
+  [ "$ok" -eq 1 ] || { echo ""; die "Fix the dependencies above and re-run /artifacts init."; }
+
+  # Resolve notion.example.json relative to this script so it works from any
+  # plugin cache path, dev clone, or symlinked install. bin/ is one level
+  # below the repo root where notion.example.json lives.
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local example="$script_dir/../notion.example.json"
+
+  echo ""
+  echo "Local cache dir: $ART_ROOT (created on demand)"
+  mkdir -p "$ART_ROOT"
+
+  # notion.json bootstrap (non-destructive)
+  if [ ! -f "$NOTION_JSON" ]; then
+    if [ -f "$example" ]; then
+      cp "$example" "$NOTION_JSON"
+      echo "Created $NOTION_JSON from template."
+    else
+      die "Missing $example — re-clone the skill or check the install."
+    fi
+  fi
+
+  # Determine state: placeholder vs configured.
+  local db_id
+  db_id=$(jq -r '.database_id // ""' "$NOTION_JSON" 2>/dev/null)
+  local is_placeholder=0
+  case "$db_id" in
+    ""|REPLACE-*|*REPLACE*) is_placeholder=1 ;;
+  esac
+
+  if [ "$is_placeholder" -eq 0 ] && [ "$reconfigure" -eq 0 ]; then
+    echo ""
+    echo "Already configured:"
+    echo "  database_id:  $db_id"
+    echo "  database_url: $(jq -r '.database_url // "(unset)"' "$NOTION_JSON")"
+    echo ""
+    echo "Re-run with: /artifacts init --reconfigure  to re-detect / re-create."
+    return 0
+  fi
+
+  # Need Claude in the loop to talk to the Notion MCP.
+  echo ""
+  if [ "$reconfigure" -eq 1 ]; then
+    echo "Reconfiguring Notion side (existing notion.json preserved until Claude updates it)."
+  else
+    echo "notion.json has placeholder IDs — Notion setup needed."
+  fi
+  echo "NEEDS_NOTION_SETUP" >&2
+  exit 2
+}
+
+main() {
+  # Parse --all anywhere in args before dispatch.
+  local args=()
+  for a in "$@"; do
+    if [ "$a" = "--all" ]; then SCOPE_ALL=1; else args+=("$a"); fi
+  done
+  set -- "${args[@]+"${args[@]}"}"
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    ''|pick)  cmd_default ;;
+    list|ls)  cmd_list ;;
+    copy|cp)  cmd_copy "$@" ;;
+    share)    cmd_share "$@" ;;
+    rm|del)   cmd_rm "$@" ;;
+    clear)    cmd_clear ;;
+    path)     cmd_path ;;
+    url|db)   cmd_url ;;
+    init|setup) cmd_init "$@" ;;
+    -h|--help|help)
+      cat <<EOF
+Usage: artifacts [--all] [subcommand]
+  (default)         auto-copy if 1 artifact in scope; otherwise emit candidates (exit 2 NEEDS_PICKER) for caller to prompt
+  list              table of name/size/age/notion-link-present (in current scope)
+  copy [name]       copy text of a specific artifact (fuzzy match) or pick
+  share [name]      copy Notion link (or emit candidates if no name and >1)
+  rm <name>         delete local cache copy (Notion row untouched)
+  clear             wipe all local cache (Notion rows untouched, no prompt)
+  path              print local cache dir
+  url               print Notion database URL
+  init              first-time setup: dep preflight, notion.json scaffold; defers Notion DB detection/creation to Claude
+  init --reconfigure re-run Notion detection even if notion.json looks configured
+
+Scope: by default, list/pick is filtered to the current git repo (origin) or cwd
+       if no remote. Falls back to all artifacts when the scoped set is empty.
+       Pass --all to disable filtering.
+Storage: $ART_ROOT (cache) · Notion (source of truth)
+EOF
+      ;;
+    *) die "Unknown subcommand: $sub (try --help)" ;;
+  esac
+}
+
+main "$@"

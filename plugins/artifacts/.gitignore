@@ -1,0 +1,8 @@
+# User-specific Notion DB IDs and page mappings.
+# In the plugin layout, the live registry lives at ~/.claude/artifacts/.notion.json
+# (NOT inside the repo). This pattern is kept for old/dev installs that still
+# scaffold notion.json into the repo root.
+notion.json
+
+# macOS cruft
+.DS_Store

@@ -1,0 +1,9 @@
+{
+  "_comment": "Template. Copy to notion.json and fill in IDs after creating your `Claude Code Artifacts` database (see README). Or run /artifacts init once that subcommand ships.",
+  "database_id": "REPLACE-WITH-YOUR-DATABASE-UUID",
+  "data_source_id": "REPLACE-WITH-YOUR-DATA-SOURCE-UUID",
+  "data_source_url": "collection://REPLACE-WITH-YOUR-DATA-SOURCE-UUID",
+  "database_url": "https://www.notion.so/REPLACE-WITH-YOUR-DATABASE-ID-NO-DASHES",
+  "title": "Claude Code Artifacts",
+  "pages": {}
+}
