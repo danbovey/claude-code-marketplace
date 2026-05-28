@@ -154,7 +154,6 @@ Personal-use prototype, recently shared. Known rough edges before wider rollout:
 - **Cross-machine `refresh`** is implemented but lightly tested; expect quirks with `>50` artifacts.
 - **`Repo` select option auto-creation** uses `ALTER COLUMN SET` which replaces the full option list; concurrent saves from different machines into new repos could clobber each other's options (transient — re-saving fixes it).
 - **No `pbcopy` fallback** for Linux/WSL (PRs welcome — `wl-copy` / `xclip` / `clip.exe`).
-- **`jq` is a hard dep** with no preflight check.
 
 ## License
 
