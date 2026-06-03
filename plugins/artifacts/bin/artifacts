@@ -186,6 +186,20 @@ copy_link() {
   echo "Copied Notion link for ${name%.*} to clipboard: $url"
 }
 
+# Convert https://www.notion.so/<id> → notion://www.notion.so/<id> so the
+# Notion macOS app opens the page directly instead of the browser.
+open_in_notion() {
+  local name="$1" url deep_link
+  url=$(notion_url_for "$name")
+  if [ -z "$url" ]; then
+    die "No Notion URL recorded for $name. Try /artifacts refresh or re-save it."
+  fi
+  command -v open >/dev/null 2>&1 || die "open(1) not available — macOS only. URL: $url"
+  deep_link="notion://${url#https://}"
+  open "$deep_link"
+  echo "Opened ${name%.*} in Notion."
+}
+
 resolve_match() {
   # Echo single filename or fail. Fuzzy match on basename.
   local query="$1" matches n
@@ -219,6 +233,25 @@ cmd_copy() {
   local name
   name=$(resolve_match "$1")
   copy_text "$name"
+}
+
+cmd_open() {
+  if [ $# -eq 0 ]; then
+    local rows count name
+    rows=$(list_rows)
+    [ -z "$rows" ] && { echo "No artifacts yet."; return 0; }
+    count=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+    if [ "$count" -eq 1 ]; then
+      name=$(printf '%s\n' "$rows" | cut -f2)
+      open_in_notion "$name"
+    else
+      emit_candidates "NEEDS_PICKER_OPEN"
+    fi
+  else
+    local name
+    name=$(resolve_match "$1")
+    open_in_notion "$name"
+  fi
 }
 
 cmd_share() {
@@ -359,6 +392,7 @@ main() {
     list|ls)  cmd_list ;;
     copy|cp)  cmd_copy "$@" ;;
     share)    cmd_share "$@" ;;
+    open)     cmd_open "$@" ;;
     rm|del)   cmd_rm "$@" ;;
     clear)    cmd_clear ;;
     path)     cmd_path ;;
@@ -371,6 +405,7 @@ Usage: artifacts [--all] [subcommand]
   list              table of name/size/age/notion-link-present (in current scope)
   copy [name]       copy text of a specific artifact (fuzzy match) or pick
   share [name]      copy Notion link (or emit candidates if no name and >1)
+  open [name]       open Notion page in the Notion desktop app via notion:// deep link
   rm <name>         delete local cache copy (Notion row untouched)
   clear             wipe all local cache (Notion rows untouched, no prompt)
   path              print local cache dir

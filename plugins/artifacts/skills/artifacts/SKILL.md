@@ -122,11 +122,23 @@ After the MCP call returns, update `~/.claude/artifacts/.notion.json` to record 
 
 (Preserve other entries — read, modify, write the JSON; don't blow it away.) These fields drive the default scope filter, so missing/wrong values mean the artifact won't appear in `/artifacts` when you `cd` back to that repo.
 
-### 6. Confirm to the user
+### 6. Auto-open if this was a new page (not an update)
+
+If step 2 took the **create** branch (no existing page_id in the registry → `notion-create-pages`), run **immediately** in a single Bash call:
+
+```bash
+artifacts open <slug>
+```
+
+This launches the Notion app on the freshly-created page so the user can review and tweak it. **Do not** auto-open on the update branch — re-saving an artifact shouldn't keep yanking focus to Notion.
+
+### 7. Confirm to the user
 
 One short line:
 
-> Saved `<slug>` → [Notion](<url>) · `<bytes>` bytes cached locally.
+> Saved `<slug>` → [Notion](<url>) · `<bytes>` bytes cached locally · opened in Notion.
+
+(Drop the "opened in Notion" suffix on the update path.)
 
 ## Subcommands
 
@@ -138,6 +150,7 @@ One short line:
 | `/artifacts list` | `artifacts list` |
 | `/artifacts copy <name>` | `artifacts copy <name>` |
 | `/artifacts share [name]` | `artifacts share [name]` |
+| `/artifacts open [name]` | `artifacts open [name]` (launches the Notion app via `notion://` deep link) |
 | `/artifacts rm <name>` | `artifacts rm <name>` |
 | `/artifacts clear` | `artifacts clear` |
 | `/artifacts url` | `artifacts url` |
@@ -152,12 +165,13 @@ When more than one artifact exists, the script exits **2** and writes tab-separa
 
 - `NEEDS_PICKER` — user wants to copy text
 - `NEEDS_PICKER_LINK` — user wants the Notion link
+- `NEEDS_PICKER_OPEN` — user wants to open the Notion page in the Notion app
 
 **When you see exit 2:**
 
 1. Parse stderr rows: `<filename>\t<size>\t<age>\t<link-present>`.
 2. Call `AskUserQuestion` (label = name without extension, description = `<size> · saved <age>`). Cap at the first ~10. `AskUserQuestion` requires ≥2 options, which is guaranteed here.
-3. After the pick: call `artifacts copy <name>` (for `NEEDS_PICKER`) or `... share <name>` (for `NEEDS_PICKER_LINK`).
+3. After the pick: call `artifacts copy <name>` (for `NEEDS_PICKER`), `artifacts share <name>` (for `NEEDS_PICKER_LINK`), or `artifacts open <name>` (for `NEEDS_PICKER_OPEN`).
 
 With **1 artifact** the script auto-copies directly (no marker, no extra round-trip).
 
